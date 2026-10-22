@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 #
 # stalwart-upgrade.sh -- interactive upgrade / downgrade of a Stalwart binary
-# that was installed with the official install.sh (Linux + systemd).
+# that was installed with the official install.sh.
 #
-# - detects architecture, binary path (systemd unit vs. `which`) and version
+# Supported service managers (same as install.sh):
+#   Linux systemd, Linux init.d, macOS launchd, FreeBSD rc.d
+# Installs under a custom PREFIX are found via the service definition.
+#
+# - detects architecture, binary path (service definition vs. `which`) and version
 # - lists newer / older releases from GitHub and lets you pick one
 # - shows the release notes of every version in between before installing
 # - optionally verifies the download with cosign (sigstore bundle)
 # - does NOT keep a backup of the old binary (use your backups / GitHub)
 #
+
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] \
+    || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 3 ]; }; then
+    echo "This script needs bash >= 4.3 (found ${BASH_VERSION:-none})." >&2
+    echo "macOS: brew install bash, then run: sudo \"\$(brew --prefix)/bin/bash\" $0" >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -23,6 +34,11 @@ COMPONENT=""
 INCLUDE_PRERELEASE=false
 DRY_RUN=false
 VERIFY=true
+
+OS=""          # linux | macos | freebsd
+SVC_TYPE=""    # systemd | initd | launchd | rcd
+SVC_FILE=""    # unit file, init script, plist or rc script
+SVC_LABEL=""   # launchd label
 
 TMP_DIR=""
 STAGED_FILE=""
@@ -75,6 +91,8 @@ install_packages() {
     elif check_cmd zypper;  then _install=(zypper --non-interactive install)
     elif check_cmd pacman;  then _install=(pacman -S --noconfirm)
     elif check_cmd apk;     then _install=(apk add)
+    elif check_cmd pkg;     then _install=(pkg install -y)
+    elif check_cmd brew;    then err "Missing command(s): $* -- run 'brew install $*' as your normal user."
     else err "Missing command(s): $* -- please install them."
     fi
 
@@ -113,11 +131,12 @@ print_usage() {
     cat <<'EOF'
 Usage: stalwart-upgrade.sh [options]
 
-Interactive upgrade / downgrade of Stalwart (Linux + systemd).
+Interactive upgrade / downgrade of Stalwart installed with install.sh
+(Linux systemd / init.d, macOS launchd, FreeBSD rc.d, any PREFIX).
 
 Options:
   --fdb                 Use the FoundationDB build (auto-detected otherwise).
-  --service NAME        systemd unit name (default: stalwart).
+  --service NAME        Service name (default: stalwart).
   --include-prerelease  Also offer pre-releases.
   --no-verify           Skip the cosign signature check.
   --dry-run             Do everything except stopping/replacing/starting.
@@ -132,11 +151,47 @@ EOF
 # detection
 # --------------------------------------------------------------------------
 
-detect_arch() {
-    local _cpu _libc="gnu" _suffix="" _ldd _features
+detect_os() {
+    local _uname
+    _uname="$(uname -s)"
+    case "$_uname" in
+        Linux)   OS="linux" ;;
+        Darwin)  OS="macos" ;;
+        FreeBSD) OS="freebsd" ;;
+        *) err "Unsupported OS: ${_uname}" ;;
+    esac
+}
 
-    [[ "$(uname -s)" == Linux ]] || err "Only Linux is supported."
+detect_arch() {
+    local _cpu
     _cpu="$(uname -m)"
+
+    case "$OS" in
+        macos)
+            # under Rosetta, uname -m reports x86_64 on Apple Silicon
+            if [[ "$_cpu" == x86_64 && "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" == 1 ]]; then
+                _cpu="arm64"
+            fi
+            case "$_cpu" in
+                arm64 | aarch64) ARCH="aarch64-apple-darwin" ;;
+                x86_64)          ARCH="x86_64-apple-darwin" ;;
+                *) err "Unsupported CPU type: ${_cpu}" ;;
+            esac
+            ;;
+        freebsd)
+            case "$_cpu" in
+                amd64 | x86_64) ARCH="x86_64-unknown-freebsd" ;;
+                *) err "Unsupported CPU type: ${_cpu} (Stalwart only ships x86_64 builds for FreeBSD)" ;;
+            esac
+            ;;
+        linux)
+            detect_arch_linux "$_cpu"
+            ;;
+    esac
+}
+
+detect_arch_linux() {
+    local _cpu="$1" _libc="gnu" _suffix="" _ldd _features
 
     _ldd="$(ldd --version 2>&1 || true)"
     [[ "$_ldd" == *musl* ]] && _libc="musl"
@@ -165,31 +220,143 @@ detect_arch() {
     ARCH="${_cpu}-unknown-linux-${_libc}${_suffix}"
 }
 
-# Prints the binary path from the ExecStart= of the systemd unit
-# (including drop-ins; the last non-empty ExecStart= wins).
+# --------------------------------------------------------------------------
+# service manager (same service types as install.sh)
+# --------------------------------------------------------------------------
+
+detect_service() {
+    case "$OS" in
+        linux)
+            if check_cmd systemctl && systemctl cat "$SERVICE" > /dev/null 2>&1; then
+                SVC_TYPE="systemd"
+                SVC_FILE="$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null || true)"
+            elif [[ -f "/etc/init.d/${SERVICE}" ]]; then
+                SVC_TYPE="initd"
+                SVC_FILE="/etc/init.d/${SERVICE}"
+            fi
+            ;;
+        macos)
+            SVC_FILE="/Library/LaunchDaemons/${SERVICE}.plist"
+            if [[ -f "$SVC_FILE" ]]; then
+                SVC_TYPE="launchd"
+                SVC_LABEL="$(plutil -extract Label raw -o - "$SVC_FILE" 2>/dev/null || printf '%s' "$SERVICE")"
+            fi
+            ;;
+        freebsd)
+            SVC_FILE="/usr/local/etc/rc.d/${SERVICE}"
+            if [[ -f "$SVC_FILE" ]]; then
+                SVC_TYPE="rcd"
+            fi
+            ;;
+    esac
+    [[ -n "$SVC_TYPE" ]] || err "No '${SERVICE}' service found on ${OS} (use --service NAME)."
+}
+
+# Prints the binary path the service starts.
 service_exec_path() {
-    local _line _path=""
-    while IFS= read -r _line; do
-        [[ "$_line" =~ ^[[:space:]]*ExecStart=(.*)$ ]] || continue
-        _line="${BASH_REMATCH[1]}"
-        [[ -z "$_line" ]] && continue
-        _line="${_line#"${_line%%[![:space:]]*}"}"
-        # strip systemd exec prefixes (-, @, +, !, :)
-        while [[ "$_line" == [-@+!:]* ]]; do _line="${_line:1}"; done
-        _path="${_line%% *}"
-    done < <(systemctl cat "$SERVICE" 2>/dev/null)
+    local _line _path="" _key _i _arg _args="" _re='exec "([^"]+)"'
+
+    case "$SVC_TYPE" in
+        systemd)
+            # including drop-ins; the last non-empty ExecStart= wins
+            while IFS= read -r _line; do
+                [[ "$_line" =~ ^[[:space:]]*ExecStart=(.*)$ ]] || continue
+                _line="${BASH_REMATCH[1]}"
+                [[ -z "$_line" ]] && continue
+                _line="${_line#"${_line%%[![:space:]]*}"}"
+                # strip systemd exec prefixes (-, @, +, !, :)
+                while [[ "$_line" == [-@+!:]* ]]; do _line="${_line:1}"; done
+                _path="${_line%% *}"
+            done < <(systemctl cat "$SERVICE" 2>/dev/null)
+            ;;
+        initd | rcd)
+            # init.d: DAEMON=/path   rc.d: procname="/path"
+            if [[ "$SVC_TYPE" == initd ]]; then _key="DAEMON"; else _key="procname"; fi
+            while IFS= read -r _line; do
+                [[ "$_line" == "${_key}="* ]] || continue
+                _line="${_line#*=}"
+                _line="${_line//\"/}"
+                _line="${_line//\'/}"
+                _path="${_line%% *}"
+            done < "$SVC_FILE"
+            ;;
+        launchd)
+            # ProgramArguments: /bin/sh -c '... exec "/path" --config=...'
+            for _i in 0 1 2 3 4 5; do
+                _arg="$(plutil -extract "ProgramArguments.${_i}" raw -o - "$SVC_FILE" 2>/dev/null)" || break
+                _args+="${_arg}"$'\n'
+            done
+            if [[ "$_args" =~ $_re ]]; then
+                _path="${BASH_REMATCH[1]}"
+            elif [[ "${_args%%$'\n'*}" != */sh ]]; then
+                _path="${_args%%$'\n'*}"
+            fi
+            ;;
+    esac
     printf '%s' "$_path"
 }
 
+svc_stop() {
+    case "$SVC_TYPE" in
+        systemd)     systemctl stop "$SERVICE" ;;
+        initd | rcd) service "$SERVICE" stop ;;
+        launchd)     launchctl bootout "system/${SVC_LABEL}" ;;
+    esac
+}
+
+svc_start() {
+    case "$SVC_TYPE" in
+        systemd)     systemctl start "$SERVICE" ;;
+        initd | rcd) service "$SERVICE" start ;;
+        launchd)     launchctl bootstrap system "$SVC_FILE" ;;
+    esac
+}
+
+svc_is_active() {
+    local _out
+    case "$SVC_TYPE" in
+        systemd)
+            [[ "$(systemctl is-active "$SERVICE" 2>/dev/null || true)" == active ]]
+            ;;
+        initd | rcd)
+            service "$SERVICE" status > /dev/null 2>&1
+            ;;
+        launchd)
+            _out="$(launchctl print "system/${SVC_LABEL}" 2>/dev/null || true)"
+            [[ "$_out" == *"state = running"* ]]
+            ;;
+    esac
+}
+
+# Shows service manager and Stalwart log output since $1 (local time,
+# YYYY-mm-dd HH:MM:SS) / $2 (UTC, YYYY-mm-ddTHH:MM:SS).
+svc_show_logs() {
+    local _since="$1" _since_utc="$2" _dir _log=""
+
+    if [[ "$SVC_TYPE" == systemd ]]; then
+        journalctl -u "$SERVICE" --since "$_since" -n 50 --no-pager 2>/dev/null || true
+    fi
+
+    # install.sh: <PREFIX>/logs or /var/log/stalwart
+    for _dir in "$(dirname "$(dirname "$BIN")")/logs" /var/log/stalwart; do
+        [[ -d "$_dir" ]] || continue
+        _log="$(ls -t "$_dir"/* 2>/dev/null | head -n 1 || true)"
+        [[ -n "$_log" ]] && break
+    done
+    if [[ -n "$_log" && -f "$_log" ]]; then
+        say ""
+        info "${_log} since the restart:"
+        # Stalwart log lines start with an ISO UTC timestamp
+        awk -v s="$_since_utc" 'p || substr($1, 1, 19) >= s { p = 1; print }' "$_log" \
+            | tail -n 40 || true
+    fi
+}
+
 detect_binary_path() {
-    local _unit_file _svc_path _which_path _svc_real _which_real
+    local _svc_path _which_path _svc_real _which_real
 
-    systemctl cat "$SERVICE" > /dev/null 2>&1 \
-        || err "systemd unit '${SERVICE}' not found (use --service NAME)."
-
-    _unit_file="$(systemctl show -p FragmentPath --value "$SERVICE" 2>/dev/null || true)"
     _svc_path="$(service_exec_path)"
-    [[ -n "$_svc_path" ]] || err "Could not read ExecStart= from unit '${SERVICE}'."
+    [[ -n "$_svc_path" ]] || err "Could not read the binary path from ${SVC_FILE}."
 
     if check_cmd which; then
         _which_path="$(which stalwart 2>/dev/null || true)"
@@ -197,8 +364,9 @@ detect_binary_path() {
         _which_path="$(command -v stalwart 2>/dev/null || true)"
     fi
 
-    say "  Service file    : ${_unit_file:-?}"
-    say "  ExecStart binary: ${_svc_path}"
+    say "  Service type    : ${SVC_TYPE}"
+    say "  Service file    : ${SVC_FILE:-?}"
+    say "  Service binary  : ${_svc_path}"
     say "  which stalwart  : ${_which_path:-<not in PATH>}"
 
     _svc_real="$(readlink -f "$_svc_path" 2>/dev/null || printf '%s' "$_svc_path")"
@@ -252,8 +420,11 @@ detect_component() {
     local _libs
     if [[ -z "$COMPONENT" ]]; then
         COMPONENT="stalwart"
-        _libs="$(ldd "$BIN" 2>&1 || true)"
-        [[ "$_libs" == *libfdb_c* ]] && COMPONENT="stalwart-foundationdb"
+        # FoundationDB builds exist for Linux only
+        if [[ "$OS" == linux ]]; then
+            _libs="$(ldd "$BIN" 2>&1 || true)"
+            [[ "$_libs" == *libfdb_c* ]] && COMPONENT="stalwart-foundationdb"
+        fi
     fi
     ASSET="${COMPONENT}-${ARCH}.tar.gz"
 }
@@ -454,7 +625,8 @@ download_and_verify() {
 
     # stage next to the target so the final mv is atomic
     STAGED_FILE="$(dirname "$BIN")/.stalwart.new.$$"
-    install -m 0755 -o root -g root "${_dir}/${_bin_name}" "$STAGED_FILE"
+    # numeric ids: the root group is "wheel" on macOS / FreeBSD
+    install -m 0755 -o 0 -g 0 "${_dir}/${_bin_name}" "$STAGED_FILE"
     rm -rf "$_dir"
 }
 
@@ -468,43 +640,48 @@ check_free_space() {
 }
 
 install_version() {
-    local _ver="$1" _active _new_ver _since
+    local _ver="$1" _new_ver _since _since_utc _i
 
     download_and_verify "$_ver"
 
     if $DRY_RUN; then
-        warn "Dry run: would stop '${SERVICE}', replace ${BIN} with ${_ver} and start it again."
+        warn "Dry run: would stop '${SERVICE}' (${SVC_TYPE}), replace ${BIN} with ${_ver} and start it again."
         rm -f "$STAGED_FILE"; STAGED_FILE=""
         return 0
     fi
 
     _since="$(date '+%Y-%m-%d %H:%M:%S')"
-    info "⏹  Stopping ${SERVICE}..."
-    systemctl stop "$SERVICE"
+    _since_utc="$(date -u '+%Y-%m-%dT%H:%M:%S')"
+    info "⏹  Stopping ${SERVICE} (${SVC_TYPE})..."
+    svc_stop || warn "Stopping ${SERVICE} reported an error -- continuing."
+    for (( _i = 0; _i < 30; _i++ )); do
+        svc_is_active || break
+        sleep 1
+    done
+    svc_is_active && warn "${SERVICE} still appears to be running."
+
     if ! mv -f "$STAGED_FILE" "$BIN"; then
-        systemctl start "$SERVICE" || true
+        svc_start || true
         err "Could not replace ${BIN} -- old binary left in place, service restarted."
     fi
     STAGED_FILE=""
     info "▶️  Starting ${SERVICE}..."
-    systemctl start "$SERVICE" || true
+    svc_start || warn "Starting ${SERVICE} reported an error."
 
     sleep 3
-    _active="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
     _new_ver="$(binary_version "$BIN")"
 
     say ""
-    journalctl -u "$SERVICE" --since "$_since" -n 50 --no-pager 2>/dev/null || true
+    svc_show_logs "$_since" "$_since_utc"
     say ""
-    if [[ "$_active" == active ]]; then
-        ok "${SERVICE} is active, binary version ${_new_ver:-?}."
-        CURRENT="${_new_ver:-$_ver}"
+    if svc_is_active; then
+        ok "${SERVICE} is running, binary version ${_new_ver:-?}."
     else
-        warn "${SERVICE} is '${_active}' after the update!"
-        warn "Check: journalctl -u ${SERVICE} -e"
-        warn "To roll back, run this script again and choose 'Downgrade' to ${CURRENT}."
-        CURRENT="${_new_ver:-$_ver}"
+        warn "${SERVICE} is NOT running after the update!"
+        warn "Check the logs above. To roll back, run this script again"
+        warn "and choose 'Downgrade' to ${CURRENT}."
     fi
+    CURRENT="${_new_ver:-$_ver}"
 }
 
 # Shows notes, asks for confirmation and installs.
@@ -607,15 +784,22 @@ main() {
     done
 
     [[ "$(id -u)" -eq 0 ]] || err "This script needs to run as root."
-    need_cmd curl jq tar systemctl journalctl uname mktemp install readlink sort grep sed df awk
+    detect_os
+    need_cmd curl jq tar uname mktemp install readlink sort grep sed df awk tail
+    detect_service
+    case "$SVC_TYPE" in
+        systemd)     need_cmd systemctl journalctl ;;
+        initd | rcd) need_cmd service ;;
+        launchd)     need_cmd launchctl plutil ;;
+    esac
 
     # /var/tmp is disk-backed; /tmp is often a small tmpfs
-    TMP_DIR="$(mktemp -d -p "${TMPDIR:-/var/tmp}" stalwart-upgrade.XXXXXX)"
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/var/tmp}/stalwart-upgrade.XXXXXX")"
     trap cleanup EXIT
 
     info "🔍 Detecting installation..."
     detect_arch
-    say "  Architecture    : ${ARCH}"
+    say "  OS / arch       : ${OS} / ${ARCH}"
     detect_binary_path
     detect_current_version
     detect_component
